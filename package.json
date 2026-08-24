@@ -1,0 +1,14 @@
+{
+  "name": "enterprise-github-actions-cicd",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Enterprise-style GitHub Actions CI/CD reference application",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
