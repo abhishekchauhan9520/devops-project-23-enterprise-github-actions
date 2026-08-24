@@ -1,0 +1,122 @@
+name: Enterprise Build & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  ci:
+    uses: ./.github/workflows/reusable-ci.yml
+    permissions:
+      contents: read
+
+  build:
+    needs: ci
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v4
+      - name: Build metadata
+        id: meta
+        shell: bash
+        run: |
+          echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Generate container SBOM
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          image: ${{ steps.meta.outputs.image }}
+          format: spdx-json
+          output-file: image.spdx.json
+          artifact-name: enterprise-ci-image-sbom
+          upload-artifact: true
+          upload-release-assets: false
+      - name: Attest image provenance and SBOM
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: image.spdx.json
+          push-to-registry: true
+
+  promote-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/promote.sh
+      - name: Stage immutable release
+        env:
+          RELEASE_IMAGE: ${{ needs.build.outputs.image }}
+          RELEASE_DIGEST: ${{ needs.build.outputs.digest }}
+        run: bash scripts/promote.sh staging "$RELEASE_IMAGE" "$RELEASE_DIGEST"
+      - name: Publish promotion record
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-promotion-record
+          path: promotion-record.txt
+          retention-days: 14
+
+  promote-production:
+    needs: [build, promote-staging]
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/promote.sh
+      - name: Promote approved release
+        env:
+          RELEASE_IMAGE: ${{ needs.build.outputs.image }}
+          RELEASE_DIGEST: ${{ needs.build.outputs.digest }}
+        run: bash scripts/promote.sh production "$RELEASE_IMAGE" "$RELEASE_DIGEST"
+      - name: Publish production promotion record
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-promotion-record
+          path: promotion-record.txt
+          retention-days: 30
